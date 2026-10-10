@@ -48,34 +48,6 @@ class MainManager(QObject):
     # ------------------------------------------------------------------ inbound
 
     def _on_ws_event(self, event_name: str, data: dict):
-        # Scoreboard data doesn't map to a UI-navigation signal — it goes
-        # straight into the shared ScoreboardHistory singleton so anything
-        # holding Injector.find(ScoreboardHistory) (e.g. ReplayScreen) sees
-        # it immediately, the same way _on_ws_settings feeds managers directly.
-        if event_name == 'score_history':
-            from app.scoreboard_history import ScoreboardHistory
-            history = Injector.find(ScoreboardHistory)
-            history.set_history(data.get('score_history', []), data.get('match_id'))
-            log.info(f"Scoreboard history received: {len(history._events)} events "
-                     f"for match {history.match_id}")
-            return
-
-        if event_name == 'score_event':
-            from app.scoreboard_history import ScoreboardHistory
-            Injector.find(ScoreboardHistory).append_event(data)
-            return
-
-        if event_name == 'start_recording':
-            from app.camera_manager import CameraManager
-            fight_start_epoch = data.get('fight_start_epoch')
-            if fight_start_epoch is not None:
-                Injector.find(CameraManager).set_fight_start_epoch(fight_start_epoch)
-            else:
-                log.warning("start_recording received without fight_start_epoch — "
-                             "scoreboard replay sync will be unavailable for this fight.")
-            self.start_recording_signal.emit()
-            return
-
         signal_attr = self._INBOUND_EVENT_MAP.get(event_name)
         if signal_attr:
             getattr(self, signal_attr).emit()

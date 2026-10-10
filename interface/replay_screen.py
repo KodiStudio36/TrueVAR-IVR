@@ -7,18 +7,20 @@ from PyQt5.QtWidgets import (
     QFrame, QSizePolicy
 )
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent, QMediaPlaylist
-from PyQt5.QtCore import QUrl, Qt, QSizeF, QEvent
+from PyQt5.QtCore import QUrl, Qt, QSizeF, QEvent, pyqtSignal
 from PyQt5.QtGui import QWheelEvent, QMouseEvent, QKeySequence, QFont
 
 from app.injector import Injector
 from app.camera_manager import CameraManager
-from app.scoreboard_history import ScoreboardHistory
-from interface.scoreboard_widget import TaekwondoScoreboard
 from interface.styles import COLORS
 
 log = logging.getLogger(__name__)
 
 class ZoomableVideoWidget(QGraphicsView):
+    # Emitted with the target position (ms) every time the camera player is
+    # explicitly seeked, so the scoreboard player can jump to the same spot.
+    seeked = pyqtSignal(int)
+
     def __init__(self, segments):
         super().__init__()
 
@@ -135,36 +137,38 @@ class ZoomableVideoWidget(QGraphicsView):
             self.mediaPlayer.play()
             self.mediaPlayer.pause()
 
+    def seek(self, position):
+        """Single entry point for every camera seek, so the scoreboard follows."""
+        position = max(0, int(position))
+        self.mediaPlayer.setPosition(position)
+        self.seeked.emit(position)
+
     def play_video(self):
         if self.mediaPlayer.position() == self.mediaPlayer.duration():
-            self.mediaPlayer.setPosition(0)
+            self.seek(0)
         self.mediaPlayer.play()
 
     def pause_video(self):
         self.mediaPlayer.pause()
 
     def set_position(self, position):
-        self.mediaPlayer.setPosition(position)
+        self.seek(position)
 
     def frame_forward(self):
         current_position = self.mediaPlayer.position()
-        new_position = int(current_position + 1000 / self.camera_manager.fps)
-        self.mediaPlayer.setPosition(new_position)
+        self.seek(current_position + 1000 / self.camera_manager.fps)
 
     def frame_backward(self):
         current_position = self.mediaPlayer.position()
-        new_position = int(current_position - 1000 / self.camera_manager.fps)
-        self.mediaPlayer.setPosition(new_position)
+        self.seek(current_position - 1000 / self.camera_manager.fps)
 
     def sec_forward(self):
         current_position = self.mediaPlayer.position()
-        new_position = int(current_position + 1000)
-        self.mediaPlayer.setPosition(new_position)
+        self.seek(current_position + 1000)
 
     def sec_backward(self):
         current_position = self.mediaPlayer.position()
-        new_position = int(current_position - 1000)
-        self.mediaPlayer.setPosition(new_position)
+        self.seek(current_position - 1000)
 
     def load_video(self, filename, position=None):
         self.filename = filename
@@ -181,11 +185,123 @@ class ZoomableVideoWidget(QGraphicsView):
         self.segments = segments
 
 
+class ScoreboardPlayer(QStackedWidget):
+    """Read-only player for the recorded scoreboard of one segment.
+
+    It never drives anything itself: ReplayScreen tells it which segment to
+    load, when to play/pause, and where to be. The scoreboard file is recorded
+    in the same GStreamer pipeline as the cameras, so camera position X ms is
+    scoreboard position X ms — no offset math needed.
+    """
+
+    WIDTH  = 250                      # same fixed width the generated scoreboard had
+    HEIGHT = round(WIDTH * 9 / 16)    # 141 — 16:9, matches the recorded 480x270
+
+    # While playing, small drift is normal (two independent decoders). Only
+    # re-seek once it's visible — ~3–4 frames at 30 fps.
+    DRIFT_TOLERANCE_MS = 120
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.camera_manager: CameraManager = Injector.find(CameraManager)
+
+        self.setFixedSize(self.WIDTH, self.HEIGHT)
+        self.setStyleSheet(f"""
+            QStackedWidget {{
+                background-color: {COLORS['bg_secondary']};
+                border: 1px solid {COLORS['border']};
+                border-radius: 10px;
+            }}
+        """)
+
+        self.video = QVideoWidget()
+        self.video.setAspectRatioMode(Qt.KeepAspectRatio)
+        self.addWidget(self.video)
+
+        self.placeholder = QLabel("No scoreboard recording")
+        self.placeholder.setAlignment(Qt.AlignCenter)
+        self.placeholder.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 12px;")
+        self.addWidget(self.placeholder)
+
+        self.player = QMediaPlayer(self, QMediaPlayer.VideoSurface)
+        self.player.setVideoOutput(self.video)
+        self.player.setMuted(True)
+        self.player.mediaStatusChanged.connect(self._status_changed)
+        self.player.seekableChanged.connect(self._seekable_changed)
+
+        self._loaded = False
+        self._url = None
+        self._pending_position = None
+
+        self.setCurrentWidget(self.placeholder)
+
+    # ------------------------------------------------------------------ loading
+
+    def load_segment(self, segment):
+        self._pending_position = None
+        if not self.camera_manager.has_scoreboard_recording(segment):
+            self._loaded = False
+            self._url = None
+            self.player.setMedia(QMediaContent())
+            self.setCurrentWidget(self.placeholder)
+            return
+
+        self._url = QUrl.fromLocalFile(self.camera_manager.get_scoreboard_filepath(segment))
+        self._loaded = True
+        self._reload()
+        self.setCurrentWidget(self.video)
+
+    def _reload(self):
+        self.player.setMedia(QMediaContent(self._url))
+        self.player.play()
+        self.player.pause()
+
+    def _status_changed(self, status):
+        # Same trick the camera player uses: after EndOfMedia the media has to
+        # be reloaded before it can seek again. Park it on its last frame.
+        if status == QMediaPlayer.EndOfMedia and self._loaded:
+            self._pending_position = self.player.duration()
+            self._reload()
+
+    def _seekable_changed(self, seekable):
+        if seekable and self._pending_position is not None:
+            self.player.setPosition(self._pending_position)
+            self._pending_position = None
+
+    # ------------------------------------------------------------------ control
+
+    def sync(self, position_ms, force=False):
+        """Move to position_ms. `force` for explicit seeks (exact frame);
+        otherwise only correct drift beyond DRIFT_TOLERANCE_MS."""
+        if not self._loaded:
+            return
+
+        target = max(0, int(position_ms))
+        duration = self.player.duration()
+        if duration > 0:
+            target = min(target, duration)
+
+        if not self.player.isSeekable():
+            # Still loading — apply once it becomes seekable.
+            self._pending_position = target
+            return
+
+        if force or abs(self.player.position() - target) > self.DRIFT_TOLERANCE_MS:
+            self.player.setPosition(target)
+
+    def set_playing(self, playing):
+        if not self._loaded:
+            return
+        if playing:
+            self.player.play()
+        else:
+            self.player.pause()
+
+
 class ReplayScreen(QWidget):
     def __init__(self):
         super().__init__()
         self.camera_manager: CameraManager = Injector.find(CameraManager)
-        self.score_history = self._resolve_score_history()
 
         self.current_page = 1
 
@@ -214,6 +330,8 @@ class ReplayScreen(QWidget):
         self.videoWidget = ZoomableVideoWidget(0)
         self.videoWidget.mediaPlayer.setPlaylist = QMediaPlaylist()
         self.videoWidget.setMinimumHeight(320)
+        # Default is 1000 ms while playing — too coarse to catch scoreboard drift.
+        self.videoWidget.mediaPlayer.setNotifyInterval(100)
 
         # Create control buttons
         self.playBtn = QPushButton()
@@ -266,19 +384,19 @@ class ReplayScreen(QWidget):
         # space is left over once the scoreboard's fixed width is taken out.
         left_container.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
-        # --- RIGHT column: read-only Taekwondo scoreboard on top ---
+        # --- RIGHT column: recorded scoreboard, synced to the camera player ---
         right_container = QWidget()
         right_layout = QVBoxLayout(right_container)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(12)
         right_layout.setAlignment(Qt.AlignTop)
 
-        self.scoreboard = TaekwondoScoreboard()
+        self.scoreboard = ScoreboardPlayer()
         right_layout.addWidget(self.scoreboard)
         right_layout.addStretch(1)
 
         # Fixed width so it stays compact and never fights the video for space
-        right_container.setFixedWidth(TaekwondoScoreboard.WIDTH)
+        right_container.setFixedWidth(ScoreboardPlayer.WIDTH)
         right_container.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
 
         # Main layout: dynamic video/controls on the left, static scoreboard on the right
@@ -294,6 +412,9 @@ class ReplayScreen(QWidget):
         self.videoWidget.mediaPlayer.positionChanged.connect(self.position_changed)
         self.videoWidget.mediaPlayer.durationChanged.connect(self.duration_changed)
         self.videoWidget.mediaPlayer.seekableChanged.connect(self.seekable_changed)
+        # Exact-frame follow for every explicit seek (slider, frame/second steps,
+        # camera switch restore, segment load).
+        self.videoWidget.seeked.connect(lambda pos: self.scoreboard.sync(pos, force=True))
 
         self.isPlaying = False
         self.duration = 0
@@ -310,20 +431,24 @@ class ReplayScreen(QWidget):
 
     # Method to handle changes in media player state (playing or paused)
     def mediastate_changed(self, state):
-        if state == QMediaPlayer.PlayingState:
+        playing = state == QMediaPlayer.PlayingState
+        if playing:
             self.playBtn.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
         else:
             self.playBtn.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
 
+        # Scoreboard mirrors the camera player's play/pause, then snaps to it.
+        self.scoreboard.set_playing(playing)
+        self.scoreboard.sync(self.videoWidget.mediaPlayer.position(), force=not playing)
+
     # Method to handle changes in video position
     def position_changed(self, position):
         self.slider.setValue(position)
-        self._sync_scoreboard(position)
+        self.scoreboard.sync(position)
 
     # Method to set the video position
     def set_position(self, position):
         self.videoWidget.set_position(position)
-        self._sync_scoreboard(position)
 
     def seekable_changed(self):
         if self.position:
@@ -342,7 +467,7 @@ class ReplayScreen(QWidget):
         self.isPlayingOnSlide = False
         if self.videoWidget.mediaPlayer.state() == QMediaPlayer.PlayingState:
             self.isPlayingOnSlide = True
-        
+
         self.videoWidget.pause_video()
 
     def sliderReleased(self):
@@ -350,7 +475,7 @@ class ReplayScreen(QWidget):
             self.videoWidget.play_video()
 
         self.slider.setFocusPolicy(Qt.NoFocus)
-        self._sync_scoreboard(self.videoWidget.mediaPlayer.position())
+        self.scoreboard.sync(self.videoWidget.mediaPlayer.position(), force=True)
 
     def frame_forward(self):
         self.videoWidget.frame_forward()
@@ -366,14 +491,15 @@ class ReplayScreen(QWidget):
 
     # Change camera angle
     def next_page(self):
-        self.current_page += 1 
+        self.current_page += 1
         if self.current_page == self.camera_manager.camera_count +1: self.current_page = 1
         self.position = self.videoWidget.mediaPlayer.position()
         self.videoWidget.load_video(self.current_page, self.videoWidget.mediaPlayer.position())
         if self.isPlaying:
             self.videoWidget.play_video()
         self.update_label()
-        self._sync_scoreboard(self.videoWidget.mediaPlayer.position())
+        # Scoreboard is shared by all cameras — it is NOT reloaded here; it
+        # follows when seekable_changed restores self.position on the camera.
 
     def seg_back(self):
         self.update_seg(self.videoWidget.segments - 1)
@@ -386,10 +512,10 @@ class ReplayScreen(QWidget):
         self.segmentBack.setDisabled(segments <= 0)
         self.videoWidget.set_segments(segments)
         self.position = None
+        self.scoreboard.load_segment(segments)
         self.videoWidget.load_video(1, position)
         self.current_page = 1
         self.update_label()
-        self._sync_scoreboard(self.videoWidget.mediaPlayer.position())
 
     def update_label(self):
         self.label.setText(f"Camera {self.current_page}, Segment {self.videoWidget.segments}")
@@ -400,57 +526,3 @@ class ReplayScreen(QWidget):
 
     def stop_video(self):
         pass
-
-    # ------------------------------------------------------------------ scoreboard sync
-
-    def _resolve_score_history(self) -> ScoreboardHistory:
-        """Injector.find() auto-creates and caches singletons on first use,
-        so this returns the SAME ScoreboardHistory instance that
-        MainManager._on_ws_event() feeds when 'score_history'/'score_event'
-        arrive over the websocket — no manual registration needed.
-        """
-        return Injector.find(ScoreboardHistory)
-
-    def _sync_scoreboard(self, position_ms):
-        """Look up the score/penalty state for the current video position
-        and push it into the read-only scoreboard widget.
-        """
-        if self.score_history.is_empty():
-            log.debug("Scoreboard sync skipped: no history data loaded yet.")
-            return
-
-        offset = self._segment_start_offset(self.videoWidget.segments)
-        if offset is None:
-            log.debug(
-                "Scoreboard sync skipped: no start offset for segment %s "
-                "(fight_start_epoch=%s) — video position can't be mapped "
-                "to fight-elapsed time yet.",
-                self.videoWidget.segments,
-                getattr(self.camera_manager, "fight_start_epoch", "?"),
-            )
-            return
-
-        elapsed = offset + (position_ms / 1000.0)
-        state = self.score_history.state_at(elapsed)
-        if state is None:
-            log.debug(
-                "Scoreboard sync: no event at or before elapsed=%.2fs "
-                "(offset=%.2fs, position=%sms, %d events loaded)",
-                elapsed, offset, position_ms, len(self.score_history._events),
-            )
-            return
-
-        log.debug("Scoreboard sync: elapsed=%.2fs -> %s", elapsed, state)
-        self.scoreboard.sync_from_state(state)
-
-    def _segment_start_offset(self, segment):
-        """Seconds elapsed since fight start when `segment` began recording.
-
-        Backed by CameraManager.get_segment_start_offset(), which compares
-        the segment's recorded start timestamp against fight_start_epoch
-        (received from core alongside the 'start_recording' event).
-        """
-        getter = getattr(self.camera_manager, "get_segment_start_offset", None)
-        if getter is None:
-            return None
-        return getter(segment)

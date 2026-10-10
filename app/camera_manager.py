@@ -2,7 +2,6 @@
 from PyQt5.QtCore import pyqtSignal, QObject
 import os
 import glob
-import time
 import gi
 
 gi.require_version("Gst", "1.0")
@@ -19,13 +18,19 @@ from app.settings_manager import SettingsManager, Setting
 class CameraManager(SettingsManager, QObject):
     is_recording_stream = pyqtSignal(bool)
 
+    # Scoreboard recording size. The replay panel shows it at a fixed
+    # 250 px width -> 250 x 141 logical px at 16:9. x2 for HiDPI / zoomed
+    # displays gives ~500 x 281; 480 x 270 is the nearest standard 16:9 size.
+    SCOREBOARD_WIDTH  = 480
+    SCOREBOARD_HEIGHT = 270
+
     # Defaults — overridden when core sends a 'settings' message
     fps            = Setting(30)
     res_height     = Setting(720)
     camera_count   = Setting(1)
     delete_records = Setting(True)
     auto_record    = Setting(False)
-    is_scoreboard  = Setting(False)
+    is_scoreboard  = Setting(False)   # pushed from core's CameraSettings.is_scoreboard
 
     def __init__(self):
         SettingsManager.__init__(self)
@@ -35,14 +40,6 @@ class CameraManager(SettingsManager, QObject):
         self.fight_num    = "0"
         self.segments     = 0
         self.pipeline     = None
-
-        # Wall-clock (epoch) time the current fight started, as told to us
-        # by core in the 'start_recording' event's fight_start_epoch field.
-        # Core and this app run as processes on the same machine, so their
-        # time.time() epochs are directly comparable — no clock sync needed.
-        self.fight_start_epoch = None
-        # segment index -> epoch time.time() when that segment began recording
-        self.segment_start_times = {}
 
         if not Gst.is_initialized():
             Gst.init(None)
@@ -66,46 +63,39 @@ class CameraManager(SettingsManager, QObject):
             print("GStreamer EOS")
 
     def start_cameras(self):
-        # Record when THIS segment actually started, so replay can later work
-        # out "elapsed seconds since fight start" for any position in it.
-        self.segment_start_times[self.segments] = time.time()
-
+        # All branches (cameras + scoreboard) live in ONE pipeline, so they
+        # share one clock and start at the same running time. `videorate`
+        # on every branch turns that into a constant frame rate: AVI has no
+        # per-frame timestamps, so without it any frame dropped by the leaky
+        # queue would shorten that file and shift it against the others.
+        # With it, position X ms means the same moment in every file.
         pipe: str = ""
 
-        if self.is_scoreboard:
-            pipe = (
+        if self._scoreboard_available():
+            pipe += (
                 f"{self._shmsrc(0)} ! "
-                f"video/x-raw,width=1280,height=720,framerate={self.fps}/1,"
+                f"video/x-raw,width=1280,height=720,framerate=30/1,"
                 f"format=NV12,interlace-mode=progressive ! "
-                f"queue leaky=downstream ! vapostproc ! "
-                f"video/x-raw,width={self.res_width // 4},height={self.res_height // 4} ! "
-                f"tee name=overlay_tee "
+                # Plain CPU scaling: at 480x270 it costs next to nothing and
+                # avoids VA-memory caps negotiation with the software encoder.
+                f"queue leaky=downstream ! videorate ! videoscale ! videoconvert ! "
+                f"video/x-raw,width={self.SCOREBOARD_WIDTH},height={self.SCOREBOARD_HEIGHT},"
+                f"framerate={self.fps}/1,format=I420 ! "
+                # MJPEG: every frame is a keyframe, so replay seeks (frame
+                # steps included) land exactly where the camera player is.
+                f"jpegenc quality=85 ! avimux ! "
+                f"filesink location={self.get_scoreboard_filepath(self.segments)} "
             )
 
         for idx in range(1, self.camera_count + 1):
-            if self.is_scoreboard:
-                pipe += (
-                    f"{self._shmsrc(idx)} ! "
-                    f"video/x-raw,width={self.res_width},height={self.res_height},"
-                    f"framerate={self.fps}/1,format=NV12,interlace-mode=progressive ! "
-                    f"queue leaky=downstream ! vapostproc ! "
-                    f"compositor name=comp{idx} "
-                    f"  sink_0::xpos=0 sink_0::ypos=0 "
-                    f"  sink_1::xpos=10 sink_1::ypos=10 ! "
-                    f"video/x-raw,width={self.res_width},height={self.res_height} ! "
-                    f"vah264enc bitrate=4000 ! avimux ! "
-                    f"filesink location={self.get_filepath(idx, self.segments)} "
-                    f"overlay_tee. ! queue ! comp{idx}. "
-                )
-            else:
-                pipe += (
-                    f"{self._shmsrc(idx)} ! "
-                    f"video/x-raw,width={self.res_width},height={self.res_height},"
-                    f"framerate={self.fps}/1,format=NV12,interlace-mode=progressive ! "
-                    f"queue leaky=downstream ! vapostproc ! "
-                    f"vah264enc bitrate=4000 ! avimux ! "
-                    f"filesink location={self.get_filepath(idx, self.segments)} "
-                )
+            pipe += (
+                f"{self._shmsrc(idx)} ! "
+                f"video/x-raw,width={self.res_width},height={self.res_height},"
+                f"framerate={self.fps}/1,format=NV12,interlace-mode=progressive ! "
+                f"queue leaky=downstream ! videorate ! vapostproc ! "
+                f"vah264enc bitrate=4000 ! avimux ! "
+                f"filesink location={self.get_filepath(idx, self.segments)} "
+            )
 
         print(pipe)
         self.pipeline = Gst.parse_launch(pipe)
@@ -131,33 +121,34 @@ class CameraManager(SettingsManager, QObject):
     def get_filepath(self, idx, segment):
         return f"{records_path}/id{self.fight_num}_camera{idx}_segment{segment}.avi"
 
+    def get_scoreboard_filepath(self, segment):
+        return f"{records_path}/id{self.fight_num}_scoreboard_segment{segment}.avi"
+
+    def has_scoreboard_recording(self, segment):
+        return os.path.exists(self.get_scoreboard_filepath(segment))
+
+    def _shm_socket(self, idx):
+        return f"/tmp/camera{idx}_shm_socket"
+
     def _shmsrc(self, idx):
-        return f"shmsrc socket-path=/tmp/camera{idx}_shm_socket do-timestamp=true is-live=true"
+        return f"shmsrc socket-path={self._shm_socket(idx)} do-timestamp=true is-live=true"
+
+    def _scoreboard_available(self):
+        # Core only creates camera0's socket when is_scoreboard is on. Both
+        # checks matter: a shmsrc pointing at a missing socket errors out the
+        # whole pipeline and would stop the camera recordings with it.
+        if not self.is_scoreboard:
+            return False
+        if not os.path.exists(self._shm_socket(0)):
+            print("Scoreboard enabled but no scoreboard socket found — recording cameras only.")
+            return False
+        return True
 
     def new_segment(self):
         self.segments += 1
 
     def reset_segments(self):
         self.segments = 0
-        self.segment_start_times = {}
-
-    def set_fight_start_epoch(self, epoch):
-        """Called by MainManager when core's 'start_recording' event arrives
-        with a fight_start_epoch — this is t=0 for the scoreboard timeline.
-        """
-        self.fight_start_epoch = epoch
-
-    def get_segment_start_offset(self, segment):
-        """Seconds elapsed since fight start when `segment` began recording,
-        or None if we don't have both timestamps yet (e.g. fight_start_epoch
-        never arrived, or this segment was never actually recorded).
-        """
-        if self.fight_start_epoch is None:
-            return None
-        started_at = self.segment_start_times.get(segment)
-        if started_at is None:
-            return None
-        return started_at - self.fight_start_epoch
 
     def release_records(self):
         if self.delete_records:
